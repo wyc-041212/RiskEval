@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import random
 from collections import defaultdict
 
-from .client import LLMClient
-from .config import Config, resolve_api_key
+from .client import ChatClient, build_client_for_provider
+from .config import Config
 from .io import (
     append_jsonl,
     load_jsonl,
@@ -88,31 +89,9 @@ def _supports_example(ex, cfg: Config) -> bool:
     return True
 
 
-def _requires_fixed_subset(data_path) -> bool:
-    low = data_path.name.casefold()
-    return "gsm8k" in low or "hle" in low
-
-
-def _enforce_dataset_protocol(cfg: Config, total_rows: int) -> None:
-    if not _requires_fixed_subset(cfg.run.data_path):
-        return
-
-    max_examples = cfg.run.max_examples
-    if max_examples is None:
-        if total_rows != 128:
-            raise ValueError(
-                "HLE/GSM8K runs must evaluate a fixed 128-example subset. "
-                "Set run.max_examples = 128 or provide a pre-truncated 128-row dataset."
-            )
-        return
-
-    if max_examples != 128:
-        raise ValueError("HLE/GSM8K runs must use run.max_examples = 128.")
-
-
 def _parse_solver_output(
     *,
-    client: LLMClient,
+    parser_client: ChatClient,
     cfg: Config,
     question: str,
     choices: list[str],
@@ -120,7 +99,7 @@ def _parse_solver_output(
     solver_raw: str,
 ):
     parser_prompt = build_parser_prompt(question, choices, solver_raw)
-    parser_raw = client.complete(
+    parser_raw = parser_client.complete(
         parser_prompt,
         system=SYSTEM_PARSER,
         model=cfg.models.parser_model,
@@ -131,7 +110,7 @@ def _parse_solver_output(
         pass
 
     repair_prompt = build_parser_repair_prompt(question, choices, solver_raw, parser_raw)
-    repair_raw = client.complete(
+    repair_raw = parser_client.complete(
         repair_prompt,
         system=SYSTEM_PARSER_REPAIR,
         model=cfg.models.parser_model,
@@ -148,7 +127,7 @@ def _parse_solver_output(
 
 def _compute_correctness(
     *,
-    client: LLMClient,
+    judge_client: ChatClient,
     cfg: Config,
     question: str,
     choices: list[str],
@@ -163,7 +142,7 @@ def _compute_correctness(
         return normalized == normalize_answer(gold_answer, task_type), False, normalized
 
     judge_prompt = build_judge_prompt(question, choices, gold_answer, solver_answer)
-    judge_raw = client.complete(judge_prompt, system=SYSTEM_JUDGE, model=cfg.models.judge_model)
+    judge_raw = judge_client.complete(judge_prompt, system=SYSTEM_JUDGE, model=cfg.models.judge_model)
     try:
         is_correct, normalized_model_answer = parse_judge_json(judge_raw)
     except ValueError as exc:
@@ -272,21 +251,41 @@ def _write_summary(
     )
 
 
+def _append_trace(
+    *,
+    trace_path,
+    enabled: bool,
+    stage: str,
+    provider: str,
+    model: str,
+    qid: str,
+    penalty: float,
+    system: str | None,
+    prompt: str,
+    response: str,
+) -> None:
+    if not enabled:
+        return
+    payload = {
+        "stage": stage,
+        "provider": provider,
+        "model": model,
+        "qid": qid,
+        "penalty": penalty,
+        "system": system or "",
+        "prompt": prompt,
+        "response": response,
+    }
+    with trace_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def run(cfg: Config) -> dict:
-    api_key = resolve_api_key(cfg.api.api_key_env)
-    client = LLMClient(
-        api_key=api_key,
-        base_url=cfg.api.base_url,
-        api_version=cfg.api.api_version,
-        model=cfg.models.solver_model,
-        temperature=cfg.models.temperature,
-        max_tokens=cfg.models.max_tokens,
-        request_timeout_sec=cfg.api.request_timeout_sec,
-        max_retries=cfg.api.max_retries,
-    )
+    solver_client = build_client_for_provider(cfg, cfg.solver_provider)
+    parser_client = build_client_for_provider(cfg, cfg.parser_provider)
+    judge_client = build_client_for_provider(cfg, cfg.judge_provider)
 
     data = load_jsonl(cfg.run.data_path)
-    _enforce_dataset_protocol(cfg, len(data))
     random.Random(cfg.run.random_seed).shuffle(data)
     if cfg.run.max_examples is not None:
         data = data[: cfg.run.max_examples]
@@ -302,6 +301,7 @@ def run(cfg: Config) -> dict:
     jsonl_path = out_dir / "example_runs.jsonl"
     csv_path = out_dir / "example_runs.csv"
     summary_path = out_dir / "summary.json"
+    trace_path = out_dir / "llm_traces.jsonl"
 
     existing_rows = load_jsonl_dicts(jsonl_path)
     if existing_rows:
@@ -310,6 +310,8 @@ def run(cfg: Config) -> dict:
             write_jsonl(jsonl_path, existing_rows)
     else:
         reset_file(jsonl_path)
+    if cfg.run.save_llm_traces:
+        reset_file(trace_path)
 
     per_example_rows: list[dict] = list(existing_rows)
     total_examples = len(data)
@@ -357,21 +359,77 @@ def run(cfg: Config) -> dict:
                 penalty,
             )
             solver_system = build_solver_system(cfg.run.prompt_strategy, penalty)
-            solver_raw = client.complete(
+            solver_raw = solver_client.complete(
                 solver_prompt,
                 system=solver_system,
                 model=cfg.models.solver_model,
                 image_url=ex.image,
             )
-
-            parsed = _parse_solver_output(
-                client=client,
-                cfg=cfg,
-                question=ex.question,
-                choices=ex.choices,
-                task_type=ex.task_type,
-                solver_raw=solver_raw,
+            _append_trace(
+                trace_path=trace_path,
+                enabled=cfg.run.save_llm_traces,
+                stage="solver",
+                provider=cfg.solver_provider,
+                model=cfg.models.solver_model,
+                qid=qid,
+                penalty=penalty,
+                system=solver_system,
+                prompt=solver_prompt,
+                response=solver_raw,
             )
+
+            parser_prompt = build_parser_prompt(ex.question, ex.choices, solver_raw)
+            parser_raw = parser_client.complete(
+                parser_prompt,
+                system=SYSTEM_PARSER,
+                model=cfg.models.parser_model,
+            )
+            _append_trace(
+                trace_path=trace_path,
+                enabled=cfg.run.save_llm_traces,
+                stage="parser",
+                provider=cfg.parser_provider,
+                model=cfg.models.parser_model,
+                qid=qid,
+                penalty=penalty,
+                system=SYSTEM_PARSER,
+                prompt=parser_prompt,
+                response=parser_raw,
+            )
+            try:
+                parsed = parse_solver_json(parser_raw, ex.task_type)
+            except ValueError:
+                repair_prompt = build_parser_repair_prompt(
+                    ex.question,
+                    ex.choices,
+                    solver_raw,
+                    parser_raw,
+                )
+                repair_raw = parser_client.complete(
+                    repair_prompt,
+                    system=SYSTEM_PARSER_REPAIR,
+                    model=cfg.models.parser_model,
+                )
+                _append_trace(
+                    trace_path=trace_path,
+                    enabled=cfg.run.save_llm_traces,
+                    stage="parser_repair",
+                    provider=cfg.parser_provider,
+                    model=cfg.models.parser_model,
+                    qid=qid,
+                    penalty=penalty,
+                    system=SYSTEM_PARSER_REPAIR,
+                    prompt=repair_prompt,
+                    response=repair_raw,
+                )
+                try:
+                    parsed = parse_solver_json(repair_raw, ex.task_type)
+                except ValueError as exc:
+                    print(
+                        f"[parser-fallback] parser model returned invalid JSON after repair; using heuristic extraction: {exc}",
+                        flush=True,
+                    )
+                    parsed = heuristic_parse_solver_output(solver_raw, ex.task_type)
 
             decision = parsed.decision
             solver_answer = parsed.final_answer if decision == "ANSWER" else ""
@@ -379,15 +437,40 @@ def run(cfg: Config) -> dict:
             used_judge = False
 
             if decision == "ANSWER" and ex.has_gold and ex.answer is not None:
-                is_correct, used_judge, normalized_solver_answer = _compute_correctness(
-                    client=client,
-                    cfg=cfg,
-                    question=ex.question,
-                    choices=ex.choices,
-                    task_type=ex.task_type,
-                    gold_answer=ex.answer,
-                    solver_answer=solver_answer,
-                )
+                if ex.task_type in {"mcq", "numeric"}:
+                    is_correct, used_judge, normalized_solver_answer = _compute_correctness(
+                        judge_client=judge_client,
+                        cfg=cfg,
+                        question=ex.question,
+                        choices=ex.choices,
+                        task_type=ex.task_type,
+                        gold_answer=ex.answer,
+                        solver_answer=solver_answer,
+                    )
+                else:
+                    judge_prompt = build_judge_prompt(ex.question, ex.choices, ex.answer, solver_answer)
+                    judge_raw = judge_client.complete(
+                        judge_prompt,
+                        system=SYSTEM_JUDGE,
+                        model=cfg.models.judge_model,
+                    )
+                    _append_trace(
+                        trace_path=trace_path,
+                        enabled=cfg.run.save_llm_traces,
+                        stage="judge",
+                        provider=cfg.judge_provider,
+                        model=cfg.models.judge_model,
+                        qid=qid,
+                        penalty=penalty,
+                        system=SYSTEM_JUDGE,
+                        prompt=judge_prompt,
+                        response=judge_raw,
+                    )
+                    try:
+                        is_correct, normalized_solver_answer = parse_judge_json(judge_raw)
+                    except ValueError as exc:
+                        raise RuntimeError(f"Judge produced invalid JSON: {exc}") from exc
+                    used_judge = True
                 solver_answer = normalized_solver_answer
                 if used_judge:
                     judge_calls_completed += 1

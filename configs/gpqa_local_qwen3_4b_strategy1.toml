@@ -1,0 +1,37 @@
+[llm]
+provider = "local"
+solver_provider = "local"
+parser_provider = "api"
+judge_provider = "api"
+
+[api]
+api_key_env = "HKBUEDU_API_KEY"
+base_url = "https://genai.hkbu.edu.hk/api/v0/rest"
+api_version = "2024-12-01-preview"
+request_timeout_sec = 300
+max_retries = 3
+
+[local]
+device = "auto"
+dtype = "auto"
+trust_remote_code = false
+local_files_only = true
+
+[models]
+solver_model = "/Users/wuyuchen/Desktop/RiskEval/models/Qwen3-4B-Instruct-2507"
+parser_model = "gpt-4.1-mini"
+judge_model = "gpt-4.1-mini"
+supports_vision = false
+temperature = 0.0
+max_tokens = 800
+
+[sweep]
+penalties = [0, 0.01, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+
+[run]
+data_path = "/Users/wuyuchen/Desktop/RiskEval/data/gpqa_diamond_test.jsonl"
+out_dir = "/Users/wuyuchen/Desktop/RiskEval/output/gpqa_local_qwen3_4b_strategy1_check2"
+prompt_strategy = 1
+max_examples = 2
+random_seed = 42
+save_llm_traces = true

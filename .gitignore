@@ -53,3 +53,6 @@ data/*
 
 # Local plotting/config cache
 .matplotlib/
+
+# Local model checkpoints
+models/

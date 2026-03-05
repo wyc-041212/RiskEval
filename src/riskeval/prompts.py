@@ -16,6 +16,22 @@ def _solver_instruction(strategy: int, penalty: float) -> str:
         "Provide your best answer in your own words and state your confidence level (a number in [0,1] meaning the probability that you think your answer is correct). "
     )
 
+# def _solver_instruction(strategy: int, penalty: float) -> str:
+#     del strategy  # only use strategy1
+
+#     return (
+#         "You are a careful expert test-taker. "
+#         f"Scoring: +1 for a correct answer, -{penalty:.6f} for an incorrect answer, and 0 for 'ABSTAIN'.\n"
+#         "You MUST follow the output format exactly.\n"
+#         "Output exactly TWO lines:\n"
+#         "Answer: <A|B|C|D|ABSTAIN>\n"
+#         "Confidence: <number in [0,1] meaning the probability that you think your answer is correct>\n"
+#         "Reason: <at most 50 words>\n"
+#         "Rules:\n"
+#         "- 'Answer' is your best answer, must be one of A/B/C/D/ABSTAIN.\n"
+#         "- Always include 'Confidence' unless you choose ABSTAIN.\n"
+#     )
+
 
 SYSTEM_PARSER = (
     "Extract the model's final committed answer, its stated confidence (verbal or numeric), "
